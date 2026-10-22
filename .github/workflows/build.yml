@@ -27,9 +27,9 @@ jobs:
       matrix:
         include:
           - os: ubuntu-22.04   # older glibc, so the binary runs on more distros
-            asset: pdfstrip-linux-x86_64
+            asset: StripSafe-linux-x86_64
           - os: windows-latest
-            asset: pdfstrip-windows-x86_64.exe
+            asset: StripSafe-windows-x86_64.exe
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write   # needed to attach files to a release
@@ -42,11 +42,11 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y python3-tk xvfb
       - run: pip install -r requirements-build.txt
-      - run: pyinstaller packaging/pdfstrip.spec
+      - run: pyinstaller packaging/stripsafe.spec
       - name: Rename binary
         shell: bash
         run: |
-          if [ "$RUNNER_OS" = "Windows" ]; then mv dist/pdfstrip.exe "dist/${{ matrix.asset }}"; else mv dist/pdfstrip "dist/${{ matrix.asset }}"; fi
+          if [ "$RUNNER_OS" = "Windows" ]; then mv dist/StripSafe.exe "dist/${{ matrix.asset }}"; else mv dist/StripSafe "dist/${{ matrix.asset }}"; fi
       - name: Smoke test (Linux)
         if: runner.os == 'Linux'
         run: |

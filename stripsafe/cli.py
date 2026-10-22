@@ -9,7 +9,7 @@ from .presets import DEFAULT_PRESET, PRESETS, get_preset
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
-        prog="pdfstrip",
+        prog="stripsafe",
         description="Strip private metadata from PDFs and images and shrink them. Runs fully offline.",
     )
     parser.add_argument("files", nargs="+", help="PDF/JPEG/PNG/WebP files or folders")

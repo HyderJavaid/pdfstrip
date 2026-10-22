@@ -1,5 +1,5 @@
 # PyInstaller spec: builds a single-file, windowed (no console) app on the current OS.
-#   pyinstaller packaging/pdfstrip.spec
+#   pyinstaller packaging/stripsafe.spec
 from PyInstaller.utils.hooks import collect_all
 
 # tkinterdnd2 ships native tkdnd libraries that must be bundled for drag-and-drop.
@@ -10,7 +10,7 @@ except Exception:
     pass  # not installed: the app falls back to the file picker
 
 a = Analysis(
-    ["../run_pdfstrip.py"],
+    ["../run_stripsafe.py"],
     pathex=[".."],
     binaries=binaries,
     datas=datas,
@@ -23,7 +23,7 @@ exe = EXE(
     a.scripts,
     a.binaries,
     a.datas,
-    name="pdfstrip",
+    name="StripSafe",
     console=False,
     upx=False,
 )

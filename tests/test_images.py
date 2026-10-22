@@ -3,8 +3,8 @@ import io
 import pytest
 from PIL import Image
 
-from pdfstrip.images import process_image, strip_jpeg_lossless
-from pdfstrip.presets import PRESETS
+from stripsafe.images import process_image, strip_jpeg_lossless
+from stripsafe.presets import PRESETS
 
 from .conftest import GPS_IFD, XMP
 

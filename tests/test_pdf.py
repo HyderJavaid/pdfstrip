@@ -3,8 +3,8 @@ import io
 import pytest
 from pypdf import PdfReader, PdfWriter
 
-from pdfstrip.pdf import PdfPasswordError, process_pdf
-from pdfstrip.presets import PRESETS
+from stripsafe.pdf import PdfPasswordError, process_pdf
+from stripsafe.presets import PRESETS
 
 
 @pytest.mark.parametrize("preset", list(PRESETS))

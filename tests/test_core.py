@@ -1,5 +1,5 @@
-from pdfstrip.core import expand_paths, output_path_for, process_file
-from pdfstrip.presets import PRESETS
+from stripsafe.core import expand_paths, output_path_for, process_file
+from stripsafe.presets import PRESETS
 
 
 def test_writes_new_file_and_leaves_original(tmp_path, jpeg_with_metadata):

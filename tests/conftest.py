@@ -29,11 +29,7 @@ def jpeg_with_metadata():
     exif[0x0110] = "Model X"               # Model
     exif[0x013B] = "Jane Secret"           # Artist
     exif[0x0112] = 6                       # Orientation: rotate 90 CW to display
-    gps = exif.get_ifd(GPS_IFD)
-    gps[1] = "N"
-    gps[2] = (51.0, 30.0, 12.0)
-    gps[3] = "W"
-    gps[4] = (0.0, 7.0, 39.0)
+    exif[GPS_IFD] = {1: "N", 2: (51.0, 30.0, 12.0), 3: "W", 4: (0.0, 7.0, 39.0)}
     buf = io.BytesIO()
     img.save(buf, "JPEG", quality=95, exif=exif, comment=b"secret comment", xmp=XMP)
     return buf.getvalue()
