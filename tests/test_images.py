@@ -6,7 +6,7 @@ from PIL import Image
 from pdfstrip.images import process_image, strip_jpeg_lossless
 from pdfstrip.presets import PRESETS
 
-from .conftest import GPS_IFD
+from .conftest import GPS_IFD, XMP
 
 SECRETS = (b"Jane Secret", b"SpyCam", b"secret comment", b"xmpmeta", b"Model X")
 
@@ -78,7 +78,7 @@ def test_png_metadata_removed(png_with_metadata, preset):
 def test_webp_metadata_removed(jpeg_with_metadata):
     with Image.open(io.BytesIO(jpeg_with_metadata)) as img:
         buf = io.BytesIO()
-        img.save(buf, "WEBP", exif=img.info["exif"], xmp=img.info["xmp"])
+        img.save(buf, "WEBP", exif=img.info["exif"], xmp=XMP)
     out = process_image(buf.getvalue(), ".webp", PRESETS["balanced"])
     assert_no_secrets(out)
     assert b"EXIF" not in out and b"XMP " not in out
