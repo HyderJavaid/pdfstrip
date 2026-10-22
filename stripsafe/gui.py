@@ -1,29 +1,28 @@
-"""StripSafe desktop window: a sidebar with Process Files, Settings and About views, dark or light."""
+"""StripSafe desktop window (Qt): a sidebar with Process Files, Settings and About, dark or light.
 
-import base64
-import io
-import queue
+All file work runs in worker processes (see workers.py); the window only receives their results as
+queued Qt signals, so the interface never waits on a PDF.
+"""
+
+import sys
 import threading
-import tkinter as tk
 from dataclasses import dataclass, field
 from pathlib import Path
-from tkinter import filedialog, messagebox
-from typing import Optional
+from typing import List, Optional
 
-from PIL import ImageOps
+from PySide6.QtCore import (QAbstractTableModel, QEvent, QModelIndex, QObject, QPointF, QRect, QRectF, QSize, Qt,
+                            Signal)
+from PySide6.QtGui import (QBrush, QColor, QFontMetrics, QIcon, QImage, QPainter, QPainterPath, QPen, QPixmap,
+                           QPolygonF)
+from PySide6.QtWidgets import (QAbstractButton, QAbstractItemView, QApplication, QButtonGroup, QFileDialog,
+                               QFrame, QHBoxLayout, QHeaderView, QLabel, QMainWindow, QMessageBox, QPushButton,
+                               QSlider, QStackedWidget, QStyledItemDelegate, QTableView, QVBoxLayout, QWidget)
 
 from . import __version__, settings as settings_store
 from .core import SUPPORTED_EXTENSIONS, Result, expand_paths, human_size, is_supported
 from .metadata import MetaReport
+from .theme import PALETTES, Palette, blend, qss
 from .workers import WorkerPool, inspect_job, process_job
-from .ui.theme import PALETTES, make_fonts
-from .ui.widgets import Button, Checkbox, Pill, Segmented, Slider, blend, draw_logo, round_rect
-
-try:
-    from tkinterdnd2 import DND_FILES, TkinterDnD
-    HAVE_DND = True
-except Exception:  # optional dependency (or its native library) not available
-    HAVE_DND = False
 
 # (label, preset name, description) for the quality slider.
 QUALITY_STEPS = [
@@ -33,7 +32,7 @@ QUALITY_STEPS = [
     ("Smallest", "strong", "Maximum savings for email"),
 ]
 NAV = [("process", "Process Files"), ("settings", "Settings"), ("about", "About")]
-COLUMNS = {0: 40, 2: 76, 3: 160, 4: 96, 5: 36}  # queue column widths; column 1 (name) stretches
+STATUS_COLORS = {"Ready": "muted", "Working": "accent", "Done": "success", "Failed": "danger"}
 
 
 @dataclass(eq=False)  # compared and hashed by identity
@@ -47,406 +46,877 @@ class Item:
     inspect_error: Optional[str] = None
     thumb: object = None   # PIL image
     result: Optional[Result] = None
-    photos: dict = field(default_factory=dict)  # cache of PhotoImage objects by size
+    pixmaps: dict = field(default_factory=dict)  # cache of QPixmaps by size
 
 
-class Row:
-    """One line of the queue. Widgets are created once and refreshed in place."""
+# --------------------------------------------------------------------------- small helpers --
+def _label(text="", name=None, wrap=False, align=None):
+    label = QLabel(text)
+    if name:
+        label.setObjectName(name)
+    label.setWordWrap(wrap)
+    if align:
+        label.setAlignment(align)
+    return label
 
-    def __init__(self, app, parent, item):
-        self.app, self.item = app, item
-        p, f = app.pal, app.fonts
-        self.frame = tk.Frame(parent, bg=p.surface)
-        self.frame.grid_columnconfigure(1, weight=1)
-        for col, w in COLUMNS.items():
-            self.frame.grid_columnconfigure(col, minsize=w)
-        self.check = Checkbox(self.frame, p, item.checked, self._on_check, bg=p.surface)
-        self.check.grid(row=0, column=0, padx=(12, 0), pady=11)
-        self.name = tk.Label(self.frame, text=item.path.name, font=f["base"], fg=p.text, bg=p.surface,
-                             anchor="w", width=1)
-        self.name.grid(row=0, column=1, sticky="ew", padx=(4, 8))
-        self.kind_cell = tk.Frame(self.frame, bg=p.surface)
-        self.kind_cell.grid(row=0, column=2, sticky="w")
-        self.size = tk.Label(self.frame, font=f["small"], fg=p.muted, bg=p.surface, anchor="w")
-        self.size.grid(row=0, column=3, sticky="w")
-        self.status_cell = tk.Frame(self.frame, bg=p.surface)
-        self.status_cell.grid(row=0, column=4, sticky="w")
-        self.remove = tk.Label(self.frame, text="✕", font=f["small"], fg=p.muted, bg=p.surface, cursor="hand2")
-        self.remove.grid(row=0, column=5)
-        self.remove.bind("<Button-1>", lambda e: app.remove_item(item))
-        self.sep = tk.Frame(parent, bg=p.border, height=1)
-        self.pill_kind = None
-        self.pill_status = None
-        self._bg = None
-        self._status_shown = None
-        for w in (self.frame, self.name, self.size, self.kind_cell, self.status_cell):
-            w.bind("<Button-1>", lambda e: app.select(item))
+
+def _button(text, variant=None, slot=None, name=None):
+    btn = QPushButton(text)
+    btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    if variant:
+        btn.setProperty("variant", variant)
+    if name:
+        btn.setObjectName(name)
+    if slot:
+        btn.clicked.connect(lambda _checked=False: slot())
+    return btn
+
+
+def _card(layout_cls=QVBoxLayout, margins=(18, 16, 18, 16), spacing=8):
+    frame = QFrame()
+    frame.setObjectName("card")
+    layout = layout_cls(frame)
+    layout.setContentsMargins(*margins)
+    layout.setSpacing(spacing)
+    return frame, layout
+
+
+def _clear(layout):
+    while layout.count():
+        child = layout.takeAt(0)
+        widget = child.widget()
+        if widget:
+            widget.hide()          # gone from the screen now, not on the next event-loop turn
+            widget.setParent(None)
+            widget.deleteLater()
+        elif child.layout():
+            _clear(child.layout())
+
+
+def _repolish(widget):
+    widget.style().unpolish(widget)
+    widget.style().polish(widget)
+
+
+def pil_to_pixmap(img, size=None, crop=False) -> QPixmap:
+    img = img.convert("RGB")
+    if size and crop:
+        from PIL import ImageOps
+        img = ImageOps.fit(img, (size, size))
+    elif size:
+        img = img.copy()
+        img.thumbnail((size, size))
+    qimg = QImage(img.tobytes(), img.width, img.height, img.width * 3, QImage.Format.Format_RGB888).copy()
+    return QPixmap.fromImage(qimg)
+
+
+def draw_logo(painter: QPainter, rect: QRectF, color: QColor, inner: QColor):
+    """A shield with a check mark."""
+    x, y, w, h = rect.x(), rect.y(), rect.width(), rect.height()
+    pts = [(.5, 0), (.92, .15), (.92, .5), (.5, 1), (.08, .5), (.08, .15)]
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(QPen(color, 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+    painter.setBrush(color)
+    painter.drawPolygon(QPolygonF([QPointF(x + px * w, y + py * h) for px, py in pts]))
+    painter.setPen(QPen(inner, max(2.0, w / 9), Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+                        Qt.PenJoinStyle.RoundJoin))
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.drawPolyline(QPolygonF([QPointF(x + .3 * w, y + .5 * h), QPointF(x + .45 * w, y + .64 * h),
+                                    QPointF(x + .72 * w, y + .34 * h)]))
+
+
+def logo_icon(pal: Palette) -> QIcon:
+    pix = QPixmap(64, 64)
+    pix.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pix)
+    draw_logo(painter, QRectF(6, 4, 52, 56), QColor(pal.accent), QColor(pal.on_accent))
+    painter.end()
+    return QIcon(pix)
+
+
+def draw_check(painter: QPainter, rect: QRectF, checked: bool, pal: Palette):
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    if checked:
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(pal.accent))
+        painter.drawRoundedRect(rect, 5, 5)
+        painter.setPen(QPen(QColor(pal.on_accent), 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+                            Qt.PenJoinStyle.RoundJoin))
+        x, y, s = rect.x(), rect.y(), rect.width()
+        painter.drawPolyline(QPolygonF([QPointF(x + s * .27, y + s * .52), QPointF(x + s * .43, y + s * .68),
+                                        QPointF(x + s * .74, y + s * .33)]))
+    else:
+        painter.setPen(QPen(QColor(pal.muted), 1.3))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(rect.adjusted(.65, .65, -.65, -.65), 5, 5)
+
+
+def draw_pill(painter: QPainter, rect: QRect, text: str, color: str, bg: str, font):
+    fm = QFontMetrics(font)
+    w, h = fm.horizontalAdvance(text) + 18, fm.height() + 8
+    box = QRectF(rect.x() + 4, rect.y() + (rect.height() - h) / 2, w, h)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor(blend(bg, color, .15)))
+    painter.drawRoundedRect(box, h / 2, h / 2)
+    painter.setPen(QColor(color))
+    painter.setFont(font)
+    painter.drawText(box, Qt.AlignmentFlag.AlignCenter, text)
+
+
+class CheckBox(QAbstractButton):
+    """Matches the queue's check marks (QCheckBox needs image files to be styled)."""
+
+    def __init__(self, pal: Palette):
+        super().__init__()
+        self.pal = pal
+        self.setCheckable(True)
+        self.setFixedSize(20, 20)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        draw_check(painter, QRectF(1, 1, 18, 18), self.isChecked(), self.pal)
+
+
+class Logo(QWidget):
+    def __init__(self, pal: Palette):
+        super().__init__()
+        self.pal = pal
+        self.setFixedSize(34, 38)
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        draw_logo(painter, QRectF(2, 2, 30, 34), QColor(self.pal.accent), QColor(self.pal.on_accent))
+
+
+# --------------------------------------------------------------------------------- queue --
+class QueueModel(QAbstractTableModel):
+    HEADERS = ["Name", "Type", "Size", "Status", ""]
+    ItemRole = Qt.ItemDataRole.UserRole
+
+    def __init__(self):
+        super().__init__()
+        self.items: List[Item] = []
+
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self.items)
+
+    def columnCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self.HEADERS)
+
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if orientation == Qt.Orientation.Horizontal:
+            if role == Qt.ItemDataRole.DisplayRole:
+                return self.HEADERS[section]
+            if role == Qt.ItemDataRole.TextAlignmentRole:
+                return int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        return None
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid():
+            return None
+        item = self.items[index.row()]
+        if role == self.ItemRole:
+            return item
+        if index.column() == 0:
+            if role == Qt.ItemDataRole.DisplayRole:
+                return item.path.name
+            if role == Qt.ItemDataRole.ToolTipRole:
+                return str(item.path)
+        return None
+
+    def flags(self, index):
+        return Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+
+    def add(self, items):
+        if items:
+            self.beginInsertRows(QModelIndex(), len(self.items), len(self.items) + len(items) - 1)
+            self.items.extend(items)
+            self.endInsertRows()
+
+    def remove(self, item):
+        row = self.items.index(item)
+        self.beginRemoveRows(QModelIndex(), row, row)
+        del self.items[row]
+        self.endRemoveRows()
+
+    def clear(self):
+        self.beginResetModel()
+        self.items.clear()
+        self.endResetModel()
+
+    def touch(self, item):
+        """Repaint one row after its item changed."""
+        try:
+            row = self.items.index(item)
+        except ValueError:
+            return
+        self.dataChanged.emit(self.index(row, 0), self.index(row, len(self.HEADERS) - 1))
+
+    def touch_all(self):
+        if self.items:
+            self.dataChanged.emit(self.index(0, 0), self.index(len(self.items) - 1, len(self.HEADERS) - 1))
+
+
+class QueueDelegate(QStyledItemDelegate):
+    """Paints the whole row itself: check box, pills, sizes and the remove cross."""
+
+    checkToggled = Signal(object)
+    removeClicked = Signal(object)
+    ROW_HEIGHT = 46
+
+    def __init__(self, window):
+        super().__init__(window)
+        self.window = window
+
+    def sizeHint(self, option, index):
+        return QSize(0, self.ROW_HEIGHT)
+
+    def _check_rect(self, option):
+        r = option.rect
+        return QRectF(r.x() + 14, r.y() + (r.height() - 18) / 2, 18, 18)
+
+    def paint(self, painter, option, index):
+        pal = self.window.pal
+        item = index.data(QueueModel.ItemRole)
+        selected = self.window.is_selected(item)
+        bg = pal.surface2 if selected else pal.surface
+        rect = option.rect
+        painter.save()
+        painter.fillRect(rect, QColor(bg))
+        painter.fillRect(QRect(rect.x(), rect.bottom(), rect.width(), 1), QColor(pal.border))
+        col = index.column()
+        font = option.font
+        small = option.font
+        small.setPointSizeF(max(8.0, font.pointSizeF() - 1))
+        if col == 0:
+            draw_check(painter, self._check_rect(option), item.checked, pal)
+            painter.setPen(QColor(pal.text))
+            painter.setFont(font)
+            text_rect = rect.adjusted(44, 0, -8, 0)
+            elided = QFontMetrics(font).elidedText(item.path.name, Qt.TextElideMode.ElideMiddle, text_rect.width())
+            painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided)
+        elif col == 1:
+            draw_pill(painter, rect, "PDF" if item.kind == "pdf" else "Image",
+                      pal.danger if item.kind == "pdf" else pal.accent, bg, small)
+        elif col == 2:
+            if item.result and item.result.ok:
+                text, color = f"{human_size(item.size)}  →  {human_size(item.result.new_size)}", pal.success
+            else:
+                text, color = human_size(item.size), pal.muted
+            painter.setPen(QColor(color))
+            painter.setFont(small)
+            painter.drawText(rect.adjusted(4, 0, 0, 0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, text)
+        elif col == 3:
+            draw_pill(painter, rect, item.status, getattr(pal, STATUS_COLORS[item.status]), bg, small)
+        else:
+            painter.setPen(QColor(pal.muted))
+            painter.setFont(small)
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "✕")
+        painter.restore()
+
+    def editorEvent(self, event, model, option, index):
+        if event.type() == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
+            item = index.data(QueueModel.ItemRole)
+            pos = event.position()
+            if index.column() == 0 and self._check_rect(option).adjusted(-6, -6, 6, 6).contains(pos):
+                self.checkToggled.emit(item)
+                return True
+            if index.column() == 4:
+                self.removeClicked.emit(item)
+                return True
+        return False
+
+
+# ------------------------------------------------------------------------------- widgets --
+class DropZone(QFrame):
+    dropped = Signal(list)
+
+    def __init__(self, add_files, add_folder):
+        super().__init__()
+        self.setObjectName("dropzone")
+        self.setAcceptDrops(True)
+        self.setFixedHeight(136)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 12)
+        layout.setSpacing(8)
+        layout.addWidget(_label("Drag & drop files here", "h2", align=Qt.AlignmentFlag.AlignCenter))
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        row.addStretch()
+        row.addWidget(_button("+  Add files", "primary", add_files))
+        row.addWidget(_button("Add folder", None, add_folder))
+        row.addStretch()
+        layout.addLayout(row)
+        layout.addWidget(_label("Supports JPG, PNG, WebP and PDF", "small", align=Qt.AlignmentFlag.AlignCenter))
+
+    def _set_active(self, active):
+        self.setProperty("active", active)
+        _repolish(self)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            self._set_active(True)
+
+    def dragLeaveEvent(self, _event):
+        self._set_active(False)
+
+    def dropEvent(self, event):
+        self._set_active(False)
+        self.dropped.emit([u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()])
+        event.acceptProposedAction()
+
+
+class QualityControl(QWidget):
+    changed = Signal(int)
+
+    def __init__(self, value):
+        super().__init__()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        layout.addWidget(_label("Compression quality", "small"))
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.setRange(0, len(QUALITY_STEPS) - 1)
+        self.slider.setPageStep(1)
+        self.slider.setFixedWidth(150)
+        self.slider.setCursor(Qt.CursorShape.PointingHandCursor)
+        layout.addWidget(self.slider)
+        self.caption = _label("", "bold")
+        layout.addWidget(self.caption)
+        self.set_value(value)
+        self.slider.valueChanged.connect(self._moved)
+
+    def _moved(self, value):
+        self.caption.setText(QUALITY_STEPS[value][0])
+        self.changed.emit(value)
+
+    def set_value(self, value):
+        self.slider.blockSignals(True)
+        self.slider.setValue(value)
+        self.slider.blockSignals(False)
+        self.caption.setText(QUALITY_STEPS[value][0])
+
+
+class OutputControl(QWidget):
+    def __init__(self, window):
+        super().__init__()
+        self.window_ = window
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        layout.addWidget(_label("Output folder", "small"))
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.path = _label("", "path")
+        self.path.setMinimumWidth(120)
+        row.addWidget(self.path, 1)
+        row.addWidget(_button("Change", None, window.pick_output))
+        layout.addLayout(row)
         self.refresh()
 
-    def _on_check(self, value):
-        self.item.checked = value
-        self.app.update_queue_chrome()
-
-    def pack(self):
-        self.frame.pack(fill="x")
-        self.sep.pack(fill="x")
-
-    def destroy(self):
-        self.frame.destroy()
-        self.sep.destroy()
-
     def refresh(self):
-        """Update in place; widgets are only touched when what they show has changed."""
-        p, f, item = self.app.pal, self.app.fonts, self.item
-        bg = p.surface2 if self.app.selected is item else p.surface
-        bg_changed = bg != self._bg
-        if bg_changed:
-            for w in (self.frame, self.name, self.size, self.kind_cell, self.status_cell, self.remove):
-                w.config(bg=bg)
-            self.check.config(bg=bg)
-            self.check.draw()
-        if self.check.checked != item.checked:
-            self.check.set(item.checked)
-        if self.pill_kind is None or bg_changed:
-            if self.pill_kind is not None:
-                self.pill_kind.destroy()
-            color = p.danger if item.kind == "pdf" else p.accent
-            self.pill_kind = Pill(self.kind_cell, "PDF" if item.kind == "pdf" else "Image", color, f["small"], bg)
-            self.pill_kind.pack()
-            self.pill_kind.bind("<Button-1>", lambda e: self.app.select(item))
-        if item.result and item.result.ok:
-            self.size.config(text=f"{human_size(item.size)}  \u2192  {human_size(item.result.new_size)}",
-                             fg=p.success)
-        else:
-            self.size.config(text=human_size(item.size), fg=p.muted)
-        if bg_changed or item.status != self._status_shown:
-            if self.pill_status is not None:
-                self.pill_status.destroy()
-            color = {"Ready": p.muted, "Working": p.accent, "Done": p.success, "Failed": p.danger}[item.status]
-            self.pill_status = Pill(self.status_cell, item.status, color, f["small"], bg)
-            self.pill_status.pack()
-            self.pill_status.bind("<Button-1>", lambda e: self.app.select(item))
-        self._bg, self._status_shown = bg, item.status
+        text = self.window_.settings.output_dir or "Next to originals"
+        self.path.setToolTip(text)
+        self.path.setText(QFontMetrics(self.path.font()).elidedText(text, Qt.TextElideMode.ElideLeft, 140))
 
 
-class App:
-    def __init__(self, root: tk.Tk):
-        self.root = root
-        # Drag-and-drop needs both the package and a root window created by it.
-        self.dnd = HAVE_DND and getattr(root, "TkdndVersion", None) is not None
-        self.settings = settings_store.load()
-        self.pal = PALETTES[self.settings.theme]
-        self.fonts = make_fonts(root)
-        self.files = []
-        self.rows = {}
-        self.selected = None
-        self.view = "process"
+class Page(QWidget):
+    def __init__(self, title, subtitle):
+        super().__init__()
+        self.setObjectName("page")
+        self.outer = QVBoxLayout(self)
+        self.outer.setContentsMargins(28, 24, 28, 24)
+        self.outer.setSpacing(0)
+        self.outer.addWidget(_label(title, "h1"))
+        self.outer.addWidget(_label(subtitle, "muted"))
+
+
+class DetailPanel(QWidget):
+    """What private data the selected file holds, a preview, and its size after processing."""
+
+    def __init__(self, window):
+        super().__init__()
+        self.window_ = window
         self.tab = "metadata"
+        self.item = None
+        self.setFixedWidth(340)
+        self.layout_ = QVBoxLayout(self)
+        self.layout_.setContentsMargins(0, 0, 0, 0)
+        self.layout_.setSpacing(14)
+
+    def show_item(self, item):
+        self.item = item
+        self.rebuild()
+
+    def rebuild(self):
+        _clear(self.layout_)
+        win, item = self.window_, self.item
+        card, lay = _card()
+        self.layout_.addWidget(card)
+        if item is None:
+            lay.addWidget(_label("Select a file to see what private data it contains.", "muted", wrap=True))
+            self.layout_.addStretch()
+            return
+
+        head = QHBoxLayout()
+        head.setSpacing(12)
+        thumb = QLabel()
+        thumb.setFixedSize(56, 56)
+        pix = self._pixmap(item, 56)
+        if pix:
+            thumb.setPixmap(pix)
+        else:
+            color = win.pal.danger if item.kind == "pdf" else win.pal.accent
+            thumb.setText("PDF" if item.kind == "pdf" else "IMG")
+            thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            thumb.setStyleSheet(f"background: {blend(win.pal.surface, color, .15)}; color: {color};"
+                                f"border-radius: 12px; font-weight: 700;")
+        head.addWidget(thumb)
+        names = QVBoxLayout()
+        names.setSpacing(2)
+        name = _label("", "bold")
+        name.setText(QFontMetrics(name.font()).elidedText(item.path.name, Qt.TextElideMode.ElideMiddle, 200))
+        name.setToolTip(str(item.path))
+        names.addStretch()
+        names.addWidget(name)
+        names.addWidget(_label(human_size(item.size), "small"))
+        names.addStretch()
+        head.addLayout(names, 1)
+        lay.addLayout(head)
+
+        tabs = QHBoxLayout()
+        tabs.setSpacing(18)
+        group = QButtonGroup(self)
+        for key, text in (("metadata", "Metadata found"), ("preview", "Preview")):
+            btn = _button(text, name="tab")
+            btn.setCheckable(True)
+            btn.setChecked(self.tab == key)
+            btn.clicked.connect(lambda _c=False, k=key: self._set_tab(k))
+            group.addButton(btn)
+            tabs.addWidget(btn)
+        tabs.addStretch()
+        lay.addLayout(tabs)
+        divider = QFrame()
+        divider.setObjectName("divider")
+        lay.addWidget(divider)
+        (self._preview if self.tab == "preview" else self._metadata)(lay, item)
+
+        size_card, slay = _card(margins=(18, 14, 18, 16), spacing=10)
+        self.layout_.addWidget(size_card)
+        slay.addWidget(_label("Size after processing", "bold"))
+        boxes = QHBoxLayout()
+        boxes.setSpacing(8)
+        boxes.addWidget(self._size_box("Original", human_size(item.size), None, None), 1)
+        boxes.addWidget(_label("→", "muted"))
+        if item.result and item.result.ok:
+            saved = item.result.saved_percent
+            boxes.addWidget(self._size_box("After", human_size(item.result.new_size), "success",
+                                           f"{saved:.0f}% smaller" if saved > 0 else "no size change"), 1)
+        else:
+            boxes.addWidget(self._size_box("After", "—", None, QUALITY_STEPS[win.settings.quality][0]), 1)
+        slay.addLayout(boxes)
+        if item.status == "Failed" and item.result is not None and item.result.error:
+            slay.addWidget(_label(item.result.error, "danger", wrap=True))
+        self.layout_.addStretch()
+
+    def _pixmap(self, item, size):
+        if item.thumb is None:
+            return None
+        if size not in item.pixmaps:
+            item.pixmaps[size] = pil_to_pixmap(item.thumb, size, crop=size <= 64)
+        return item.pixmaps[size]
+
+    def _size_box(self, title, value, color, caption):
+        box = QFrame()
+        box.setObjectName("inset")
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(12, 10, 12, 10)
+        lay.setSpacing(0)
+        lay.addWidget(_label(title, "small"))
+        lay.addWidget(_label(value, color or "value"))
+        if color:
+            lay.itemAt(1).widget().setStyleSheet("font-size: 12pt; font-weight: 600;")  # "success" colour at value size
+        lay.addWidget(_label(caption or " ", "small"))
+        return box
+
+    def _set_tab(self, key):
+        self.tab = key
+        self.rebuild()
+
+    def _metadata(self, lay, item):
+        if item.report is None:
+            if item.inspect_error:
+                lay.addWidget(_label(item.inspect_error, "danger", wrap=True))
+            else:
+                lay.addWidget(_label("Reading metadata…", "muted"))
+            return
+        report = item.report
+        if report.note:
+            lay.addWidget(_label(report.note, "danger", wrap=True))
+            return
+        if report.clean:
+            lay.addWidget(_label("No identifying metadata found.", "success"))
+            return
+        for label, value in report.fields:
+            row = QHBoxLayout()
+            row.addWidget(_label(label, "muted"))
+            row.addStretch()
+            val = _label(align=Qt.AlignmentFlag.AlignRight)
+            val.setText(QFontMetrics(val.font()).elidedText(value, Qt.TextElideMode.ElideRight, 190))
+            val.setToolTip(value)
+            row.addWidget(val)
+            lay.addLayout(row)
+        if report.other_count:
+            row = QHBoxLayout()
+            row.addWidget(_label("Other (EXIF, IPTC, XMP)", "muted"))
+            row.addStretch()
+            row.addWidget(_label(f"{report.other_count} more"))
+            lay.addLayout(row)
+        pal, done = self.window_.pal, item.status == "Done"
+        color = pal.success if done else pal.danger
+        tag = _label("Removed after processing." if done else "This metadata will be removed.")
+        tag.setStyleSheet(f"background: {blend(pal.surface, color, .14)}; color: {color}; border-radius: 6px;"
+                          f"padding: 5px 10px; font-size: 9pt;")
+        row = QHBoxLayout()
+        row.addWidget(tag)
+        row.addStretch()
+        lay.addSpacing(6)
+        lay.addLayout(row)
+
+    def _preview(self, lay, item):
+        pix = self._pixmap(item, 270)
+        if pix:
+            label = QLabel()
+            label.setPixmap(pix)
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lay.addWidget(label)
+        else:
+            text = "PDF previews are not shown." if item.kind == "pdf" else "Preview unavailable."
+            lay.addWidget(_label(text, "muted", align=Qt.AlignmentFlag.AlignCenter))
+
+
+class Bridge(QObject):
+    """Carries results from worker callbacks (any thread) to the window as queued signals."""
+
+    meta = Signal(object, object, object, object)  # item, report, thumbnail, error
+    started = Signal(object)
+    done = Signal(object, object)
+    finished = Signal()
+
+
+# ------------------------------------------------------------------------------ main window --
+class MainWindow(QMainWindow):
+    def __init__(self, settings=None, pool=None):
+        super().__init__()
+        self.settings = settings or settings_store.load()
+        self.pal = PALETTES[self.settings.theme]
+        self.pool = pool or WorkerPool()
         self.working = False
         self.summary = ""
-        self.events = queue.Queue()
-        self.pool = WorkerPool()
-        root.protocol("WM_DELETE_WINDOW", self.close)
-        root.title("StripSafe")
-        root.geometry("1240x740")
-        root.minsize(1120, 640)
-        self.build()
-        root.after(40, self._poll)
+        self.selected: Optional[Item] = None
+        self.model = QueueModel()
+        self.bridge = Bridge()
+        self.bridge.meta.connect(self._on_meta)
+        self.bridge.started.connect(self._on_started)
+        self.bridge.done.connect(self._on_done)
+        self.bridge.finished.connect(self._on_finished)
+        self.setWindowTitle("StripSafe")
+        self.resize(1240, 740)
+        self.setMinimumSize(1180, 640)
+        self.setAcceptDrops(True)
 
-    # ------------------------------------------------------------ layout --
-    def build(self):
-        """(Re)build the whole window from state. Used at start and when the theme changes."""
-        for child in self.root.winfo_children():
-            child.destroy()
-        self.pal = PALETTES[self.settings.theme]
-        p = self.pal
-        self.rows = {}
-        self.root.config(bg=p.bg)
-        self.root.grid_columnconfigure(1, weight=1)
-        self.root.grid_rowconfigure(0, weight=1)
-        self._build_sidebar()
-        self.content = tk.Frame(self.root, bg=p.bg)
-        self.content.grid(row=0, column=1, sticky="nsew")
-        self._show_view()
+        root = QWidget()
+        root.setObjectName("root")
+        self.setCentralWidget(root)
+        outer = QHBoxLayout(root)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        outer.addWidget(self._build_sidebar())
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self._build_process())
+        self.stack.addWidget(self._build_settings())
+        self.stack.addWidget(self._build_about())
+        outer.addWidget(self.stack, 1)
+        self.apply_theme()
+        self._update_chrome()
 
+    # ----- sidebar
     def _build_sidebar(self):
-        p, f = self.pal, self.fonts
-        side = tk.Frame(self.root, bg=p.surface, width=230, highlightbackground=p.border, highlightthickness=0)
-        side.grid(row=0, column=0, sticky="ns")
-        side.grid_propagate(False)
-        tk.Frame(self.root, bg=p.border, width=1).grid(row=0, column=0, sticky="nse")
-        brand = tk.Frame(side, bg=p.surface)
-        brand.pack(fill="x", padx=20, pady=(26, 22))
-        logo = tk.Canvas(brand, width=34, height=38, bg=p.surface, highlightthickness=0)
-        logo.pack(side="left")
-        draw_logo(logo, 2, 2, 32, p.accent, p.on_accent)
-        names = tk.Frame(brand, bg=p.surface)
-        names.pack(side="left", padx=10)
-        tk.Label(names, text="StripSafe", font=f["logo"], fg=p.text, bg=p.surface).pack(anchor="w")
-        tk.Label(names, text="Clean files. Keep privacy.", font=f["small"], fg=p.muted, bg=p.surface).pack(anchor="w")
+        side = QFrame()
+        side.setObjectName("sidebar")
+        side.setFixedWidth(230)
+        lay = QVBoxLayout(side)
+        lay.setContentsMargins(0, 24, 0, 18)
+        lay.setSpacing(2)
+        brand = QHBoxLayout()
+        brand.setContentsMargins(20, 0, 20, 18)
+        brand.setSpacing(10)
+        self.logo = Logo(self.pal)
+        brand.addWidget(self.logo)
+        names = QVBoxLayout()
+        names.setSpacing(0)
+        names.addWidget(_label("StripSafe", "logo"))
+        names.addWidget(_label("Clean files. Keep privacy.", "small"))
+        brand.addLayout(names)
+        lay.addLayout(brand)
+        self.nav_group = QButtonGroup(self)
+        self.nav_buttons = {}
+        for index, (key, text) in enumerate(NAV):
+            btn = _button(text, name="nav")
+            btn.setCheckable(True)
+            btn.setChecked(index == 0)
+            btn.clicked.connect(lambda _c=False, i=index: self.stack.setCurrentIndex(i))
+            self.nav_group.addButton(btn)
+            self.nav_buttons[key] = btn
+            lay.addWidget(btn)
+        lay.addStretch()
+        note = QFrame()
+        note.setObjectName("localNote")
+        nlay = QVBoxLayout(note)
+        nlay.setContentsMargins(14, 12, 14, 12)
+        nlay.setSpacing(2)
+        nlay.addWidget(_label("100% local", "success"))
+        nlay.itemAt(0).widget().setStyleSheet("font-weight: 600;")
+        nlay.addWidget(_label("Your files never leave this computer. StripSafe makes no network connections.",
+                              "small", wrap=True))
+        wrap = QVBoxLayout()
+        wrap.setContentsMargins(16, 0, 16, 0)
+        wrap.addWidget(note)
+        lay.addLayout(wrap)
+        return side
 
-        for key, label in NAV:
-            active = key == self.view
-            row = tk.Frame(side, bg=p.surface2 if active else p.surface, cursor="hand2")
-            row.pack(fill="x", padx=12, pady=2)
-            bar = tk.Frame(row, bg=p.accent if active else row["bg"], width=3)
-            bar.pack(side="left", fill="y", pady=8)
-            lbl = tk.Label(row, text=label, font=f["bold"] if active else f["base"], anchor="w",
-                           fg=p.text if active else p.muted, bg=row["bg"], padx=14, pady=10)
-            lbl.pack(side="left", fill="x", expand=True)
-            for w in (row, lbl, bar):
-                w.bind("<Button-1>", lambda e, k=key: self.switch_view(k))
-            if not active:
-                for w in (row, lbl):
-                    w.bind("<Enter>", lambda e, r=row, l=lbl: (r.config(bg=p.surface2), l.config(bg=p.surface2)))
-                    w.bind("<Leave>", lambda e, r=row, l=lbl: (r.config(bg=p.surface), l.config(bg=p.surface)))
+    # ----- process page
+    def _build_process(self):
+        page = QWidget()
+        page.setObjectName("page")
+        lay = QHBoxLayout(page)
+        lay.setContentsMargins(28, 24, 24, 24)
+        lay.setSpacing(24)
+        main = QVBoxLayout()
+        main.setSpacing(0)
+        main.addWidget(_label("Clean your files", "h1"))
+        main.addWidget(_label("Remove metadata and shrink images and PDFs, right here on this computer.", "muted"))
+        main.addSpacing(18)
+        self.dropzone = DropZone(self.add_files, self.add_folder)
+        self.dropzone.dropped.connect(self.add_paths)
+        main.addWidget(self.dropzone)
+        main.addSpacing(14)
 
-        note = tk.Frame(side, bg=p.bg, highlightbackground=p.border, highlightthickness=1)
-        note.pack(side="bottom", fill="x", padx=16, pady=20)
-        tk.Label(note, text="100% local", font=f["bold"], fg=p.success, bg=p.bg, anchor="w").pack(
-            fill="x", padx=14, pady=(12, 0))
-        tk.Label(note, text="Your files never leave this computer. StripSafe makes no network connections.",
-                 font=f["small"], fg=p.muted, bg=p.bg, anchor="w", justify="left", wraplength=160).pack(
-            fill="x", padx=14, pady=(2, 12))
+        queue, qlay = _card(margins=(0, 0, 0, 0), spacing=0)
+        head = QHBoxLayout()
+        head.setContentsMargins(18, 14, 14, 8)
+        head.setSpacing(14)
+        self.queue_title = _label("", "h2")
+        head.addWidget(self.queue_title)
+        self.summary_label = _label("", "success")
+        head.addWidget(self.summary_label)
+        head.addStretch()
+        head.addWidget(_button("Clear all", "ghost", self.clear))
+        qlay.addLayout(head)
+        self.table = QTableView()
+        self.table.setModel(self.model)
+        self.delegate = QueueDelegate(self)
+        self.delegate.checkToggled.connect(self._toggle_item)
+        self.delegate.removeClicked.connect(self.remove_item)
+        self.table.setItemDelegate(self.delegate)
+        self.table.setShowGrid(False)
+        self.table.setFrameShape(QFrame.Shape.NoFrame)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.table.verticalHeader().hide()
+        self.table.verticalHeader().setDefaultSectionSize(QueueDelegate.ROW_HEIGHT)
+        header = self.table.horizontalHeader()
+        header.setSectionsClickable(False)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for col, width in ((1, 84), (2, 170), (3, 100), (4, 40)):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
+            self.table.setColumnWidth(col, width)
+        header.setFixedHeight(32)
+        self.table.selectionModel().currentRowChanged.connect(self._on_current_row)
+        self.select_all = CheckBox(self.pal)
+        self.select_all.setChecked(True)
+        self.select_all.clicked.connect(self._toggle_all)
+        self.select_all.setParent(header)
+        self.select_all.move(14, 6)
+        qlay.addWidget(self.table, 1)
+        self.empty = _label("No files yet. Add or drop some above.", "muted", align=Qt.AlignmentFlag.AlignCenter)
+        self.empty.setParent(self.table.viewport())
+        self.table.viewport().installEventFilter(self)
+        main.addWidget(queue, 1)
+        main.addSpacing(14)
 
-    def switch_view(self, key):
-        if key == self.view:
-            return
-        self.view = key
-        self.build()
+        bar, blay = _card(QHBoxLayout, margins=(16, 14, 16, 14), spacing=18)
+        self.quality = QualityControl(self.settings.quality)
+        self.quality.changed.connect(self.set_quality)
+        blay.addWidget(self.quality)
+        self.output = OutputControl(self)
+        blay.addWidget(self.output, 1)
+        self.go = _button("Process files", "primary", self.start)
+        self.go.setMinimumSize(140, 44)
+        blay.addWidget(self.go)
+        main.addWidget(bar)
+        lay.addLayout(main, 1)
 
-    def _show_view(self):
-        {"process": self._build_process, "settings": self._build_settings, "about": self._build_about}[self.view]()
+        self.detail = DetailPanel(self)
+        lay.addWidget(self.detail)
+        self.detail.rebuild()
+        return page
 
-    # -------------------------------------------------------- shared bits --
-    def _card(self, parent, **pack):
-        card = tk.Frame(parent, bg=self.pal.surface, highlightbackground=self.pal.border, highlightthickness=1)
-        if pack:
-            card.pack(**pack)
-        return card
+    def eventFilter(self, obj, event):
+        try:
+            if obj is self.table.viewport() and event.type() == QEvent.Type.Resize:
+                self._place_empty()
+        except RuntimeError:  # the table is already gone while the app shuts down
+            pass
+        return super().eventFilter(obj, event)
 
-    def _title(self, parent, title, subtitle):
-        p, f = self.pal, self.fonts
-        tk.Label(parent, text=title, font=f["h1"], fg=p.text, bg=p.bg, anchor="w").pack(fill="x")
-        tk.Label(parent, text=subtitle, font=f["base"], fg=p.muted, bg=p.bg, anchor="w").pack(fill="x", pady=(2, 0))
+    def _place_empty(self):
+        vp = self.table.viewport()
+        self.empty.setGeometry(0, 0, vp.width(), min(vp.height(), 120))
 
-    def _quality_controls(self, parent, bg, on_change=None):
-        """Slider plus its label; returns the container frame."""
-        p, f = self.pal, self.fonts
-        box = tk.Frame(parent, bg=bg)
-        tk.Label(box, text="Compression quality", font=f["small"], fg=p.muted, bg=bg, anchor="w").pack(fill="x")
-        label = tk.Label(box, font=f["bold"], fg=p.text, bg=bg, anchor="w")
+    # ----- settings / about pages
+    def _setting_row(self, lay, title, subtitle, control):
+        card, clay = _card(QHBoxLayout, margins=(22, 16, 22, 16), spacing=16)
+        texts = QVBoxLayout()
+        texts.setSpacing(2)
+        texts.addWidget(_label(title, "bold"))
+        texts.addWidget(_label(subtitle, "small"))
+        clay.addLayout(texts, 1)
+        clay.setAlignment(texts, Qt.AlignmentFlag.AlignVCenter)
+        clay.addWidget(control)
+        lay.addSpacing(14)
+        lay.addWidget(card)
 
-        def changed(idx):
-            self.settings.quality = idx
+    def _build_settings(self):
+        page = Page("Settings", "Your choices are saved on this computer only.")
+        lay = page.outer
+        seg = QWidget()
+        slay = QHBoxLayout(seg)
+        slay.setContentsMargins(0, 0, 0, 0)
+        slay.setSpacing(8)
+        self.theme_group = QButtonGroup(self)
+        self.theme_buttons = {}
+        for key, text in (("dark", "Dark"), ("light", "Light")):
+            btn = _button(text, "seg")
+            btn.setCheckable(True)
+            btn.setChecked(self.settings.theme == key)
+            btn.setMinimumWidth(92)
+            btn.clicked.connect(lambda _c=False, k=key: self.set_theme(k))
+            self.theme_group.addButton(btn)
+            self.theme_buttons[key] = btn
+            slay.addWidget(btn)
+        lay.addSpacing(6)
+        self._setting_row(lay, "Appearance", "Switch between the dark and light theme.", seg)
+        self.quality2 = QualityControl(self.settings.quality)
+        self.quality2.changed.connect(self.set_quality)
+        self._setting_row(lay, "Default compression", "Used for every batch you process.", self.quality2)
+        box = QWidget()
+        blay = QVBoxLayout(box)
+        blay.setContentsMargins(0, 0, 0, 0)
+        self.output2 = OutputControl(self)
+        blay.addWidget(self.output2)
+        reset = _button("Save next to originals", "ghost", self.reset_output)
+        blay.addWidget(reset, 0, Qt.AlignmentFlag.AlignRight)
+        box.setFixedWidth(330)
+        self._setting_row(lay, "Output folder", "Cleaned copies are saved here. Originals are never changed.", box)
+        lay.addStretch()
+        return page
+
+    def _build_about(self):
+        page = Page("About StripSafe", f"Version {__version__}")
+        card, clay = _card(margins=(22, 8, 22, 18), spacing=2)
+        blocks = [
+            ("What it does", "Removes hidden personal data from PDFs and images (author names, GPS location, camera "
+                             "details, timestamps, editing history) and compresses them so they are easy to email."),
+            ("Private by design", "Everything happens on this computer. StripSafe never connects to the internet and "
+                                  "never uploads your files. Cleaned copies are saved as new files, so your originals "
+                                  "are never changed."),
+            ("Supported files", "PDF, JPG, PNG and WebP."),
+            ("Good to know", "Text and pictures you can see on the page are not altered. Password-protected PDFs need "
+                             "their password removed first."),
+            ("License", "Free software under the GNU GPL v3."),
+        ]
+        for title, text in blocks:
+            clay.addSpacing(10)
+            clay.addWidget(_label(title, "bold"))
+            clay.addWidget(_label(text, "muted", wrap=True))
+        page.outer.addSpacing(20)
+        page.outer.addWidget(card)
+        page.outer.addStretch()
+        return page
+
+    # ----- theme / settings
+    def apply_theme(self):
+        self.pal = PALETTES[self.settings.theme]
+        QApplication.instance().setStyleSheet(qss(self.pal))
+        self.setWindowIcon(logo_icon(self.pal))
+        self.logo.pal = self.pal
+        self.logo.update()
+        self.select_all.pal = self.pal
+        self.select_all.update()
+        self.table.viewport().update()
+        self.detail.rebuild()
+        for key, btn in self.theme_buttons.items():
+            btn.setChecked(key == self.settings.theme)
+
+    def set_theme(self, theme):
+        if theme != self.settings.theme:
+            self.settings.theme = theme
             settings_store.save(self.settings)
-            label.config(text=QUALITY_STEPS[idx][0])
-            if on_change:
-                on_change()
+            self.apply_theme()
 
-        slider = Slider(box, p, len(QUALITY_STEPS), self.settings.quality, changed, width=160, bg=bg)
-        slider.pack(fill="x", pady=(4, 0))
-        label.pack(fill="x")
-        label.config(text=QUALITY_STEPS[self.settings.quality][0])
-        return box
-
-    def _output_controls(self, parent, bg):
-        p, f = self.pal, self.fonts
-        box = tk.Frame(parent, bg=bg)
-        tk.Label(box, text="Output folder", font=f["small"], fg=p.muted, bg=bg, anchor="w").pack(fill="x")
-        row = tk.Frame(box, bg=bg)
-        row.pack(fill="x", pady=(4, 0))
-        self.out_label = tk.Label(row, font=f["base"], fg=p.text, bg=p.surface2, anchor="w", padx=10, pady=7, width=14)
-        self.out_label.pack(side="left", fill="x", expand=True)
-        Button(row, "Change", self.pick_output, p, f["base"], height=32, bg=bg).pack(side="left", padx=(8, 0))
-        self._refresh_out_label()
-        return box
-
-    def _refresh_out_label(self):
-        text = self.settings.output_dir or "Next to originals"
-        if len(text) > 38:
-            text = "…" + text[-37:]
-        self.out_label.config(text=text)
+    def set_quality(self, idx):
+        self.settings.quality = idx
+        settings_store.save(self.settings)
+        self.quality.set_value(idx)
+        self.quality2.set_value(idx)
+        self.detail.rebuild()
 
     def pick_output(self):
-        folder = filedialog.askdirectory(title="Save cleaned files in")
+        folder = QFileDialog.getExistingDirectory(self, "Save cleaned files in")
         if folder:
             self.settings.output_dir = folder
             settings_store.save(self.settings)
-            self._refresh_out_label()
+            self.output.refresh()
+            self.output2.refresh()
 
-    # ------------------------------------------------------- process view --
-    def _build_process(self):
-        p, f = self.pal, self.fonts
-        self.content.grid_columnconfigure(0, weight=1)
-        self.content.grid_columnconfigure(1, minsize=364)  # detail panel (340) plus its right margin
-        self.content.grid_rowconfigure(0, weight=1)
-        main = tk.Frame(self.content, bg=p.bg)
-        main.grid(row=0, column=0, sticky="nsew", padx=(28, 16), pady=24)
-        self.detail_host = tk.Frame(self.content, bg=p.bg, width=340)
-        self.detail_host.grid(row=0, column=1, sticky="ns", padx=(0, 24), pady=24)
-        self.detail_host.grid_propagate(False)
+    def reset_output(self):
+        self.settings.output_dir = None
+        settings_store.save(self.settings)
+        self.output.refresh()
+        self.output2.refresh()
 
-        self._title(main, "Clean your files", "Remove metadata and shrink images and PDFs, right here on this computer.")
+    # ----- queue actions
+    def is_selected(self, item):
+        return item is self.selected
 
-        # Drop zone
-        zone = tk.Canvas(main, height=132, bg=p.bg, highlightthickness=0)
-        zone.pack(fill="x", pady=(18, 14))
-        self.zone = zone
-        hint = "Drag & drop files here" if self.dnd else "Add files to get started"
-        sub = "Supports JPG, PNG, WebP and PDF"
-        btn_add = Button(zone, "+  Add files", self.add_files, p, f["bold"], variant="primary", height=38, bg=p.surface)
-        btn_dir = Button(zone, "Add folder", self.add_folder, p, f["base"], height=38, bg=p.surface)
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
 
-        def draw_zone(_e=None, active=False):
-            zone.delete("all")
-            w = zone.winfo_width()
-            round_rect(zone, 2, 2, w - 2, 130, 14, fill=p.surface, outline=p.accent if active else p.border,
-                       dash=(5, 4), width=1.5)
-            zone.create_text(w / 2, 30, text=hint, font=f["h2"], fill=p.text)
-            zone.create_window(w / 2 - 62, 72, window=btn_add)
-            zone.create_window(w / 2 + 62, 72, window=btn_dir)
-            zone.create_text(w / 2, 110, text=sub, font=f["small"], fill=p.muted)
-
-        zone.bind("<Configure>", draw_zone)
-        if self.dnd:
-            self._register_drop(zone, draw_zone)
-
-        # Queue
-        queue_card = self._card(main)
-        queue_card.pack(fill="both", expand=True)
-        head = tk.Frame(queue_card, bg=p.surface)
-        head.pack(fill="x", padx=18, pady=(14, 8))
-        self.queue_title = tk.Label(head, font=f["h2"], fg=p.text, bg=p.surface)
-        self.queue_title.pack(side="left")
-        self.summary_label = tk.Label(head, font=f["small"], fg=p.success, bg=p.surface)
-        self.summary_label.pack(side="left", padx=14)
-        Button(head, "Clear all", self.clear, p, f["small"], variant="ghost", height=28, bg=p.surface).pack(side="right")
-
-        cols = tk.Frame(queue_card, bg=p.surface2)
-        cols.pack(fill="x")
-        cols.grid_columnconfigure(1, weight=1)
-        for col, w in COLUMNS.items():
-            cols.grid_columnconfigure(col, minsize=w)
-        self.select_all = Checkbox(cols, p, True, self._toggle_all, bg=p.surface2)
-        self.select_all.grid(row=0, column=0, padx=(12, 0), pady=8)
-        for col, text in ((1, "Name"), (2, "Type"), (3, "Size"), (4, "Status")):
-            tk.Label(cols, text=text, font=f["small"], fg=p.muted, bg=p.surface2, anchor="w").grid(
-                row=0, column=col, sticky="w", padx=(4, 0) if col == 1 else 0)
-
-        body = tk.Frame(queue_card, bg=p.surface)
-        body.pack(fill="both", expand=True)
-        self.rows_canvas = tk.Canvas(body, bg=p.surface, highlightthickness=0, height=120)
-        self.rows_canvas.pack(fill="both", expand=True)
-        self.rows_frame = tk.Frame(self.rows_canvas, bg=p.surface)
-        win = self.rows_canvas.create_window(0, 0, window=self.rows_frame, anchor="nw")
-        self.rows_canvas.bind("<Configure>", lambda e: self.rows_canvas.itemconfig(win, width=e.width))
-        self.rows_frame.bind("<Configure>", lambda e: self.rows_canvas.config(
-            scrollregion=self.rows_canvas.bbox("all")))
-        self.empty_label = tk.Label(self.rows_canvas, text="No files yet. Add or drop some above.",
-                                    font=f["base"], fg=p.muted, bg=p.surface)
-        self._bind_wheel(self.rows_canvas)
-        if self.dnd:
-            self._register_drop(self.rows_canvas)
-
-        # Bottom bar
-        bar = self._card(main)
-        bar.pack(fill="x", pady=(14, 0))
-        inner = tk.Frame(bar, bg=p.surface)
-        inner.pack(fill="x", padx=18, pady=14)
-        self.go = Button(inner, "Process files", self.start, p, f["bold"], variant="primary", width=140, height=44,
-                         bg=p.surface)
-        self.go.pack(side="right", padx=(16, 0))  # packed first so it is never squeezed out
-        self._quality_controls(inner, p.surface, on_change=self._refresh_detail).pack(side="left", padx=(0, 20))
-        self._output_controls(inner, p.surface).pack(side="left", fill="x", expand=True)
-
-        for item in self.files:
-            self._make_row(item)
-        self.update_queue_chrome()
-        self._refresh_detail()
-
-    def _bind_wheel(self, canvas):
-        def on_wheel(event):
-            if canvas.bbox("all") is None or self.rows_frame.winfo_height() <= canvas.winfo_height():
-                return
-            delta = -1 if (event.num == 4 or event.delta > 0) else 1
-            canvas.yview_scroll(delta * 2, "units")
-
-        def enter(_e):
-            canvas.bind_all("<MouseWheel>", on_wheel)
-            canvas.bind_all("<Button-4>", on_wheel)
-            canvas.bind_all("<Button-5>", on_wheel)
-
-        def leave(_e):
-            for ev in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-                canvas.unbind_all(ev)
-
-        canvas.bind("<Enter>", enter)
-        canvas.bind("<Leave>", leave)
-
-    def _make_row(self, item):
-        row = Row(self, self.rows_frame, item)
-        row.pack()
-        self.rows[item] = row
-        return row
-
-    def update_queue_chrome(self):
-        """Refresh counts, empty state, select-all box and the Process button."""
-        if self.view != "process":
-            return
-        n = len(self.files)
-        self.queue_title.config(text=f"Files queue ({n})")
-        self.summary_label.config(text=self.summary)
-        if n:
-            self.empty_label.place_forget()
-        else:
-            self.empty_label.place(relx=0.5, rely=0.5, anchor="center")
-        self.select_all.set(bool(self.files) and all(i.checked for i in self.files))
-        todo = self._todo()
-        self.go.set_text(f"Process files ({len(todo)})" if todo else "Process files")
-        self.go.set_enabled(bool(todo) and not self.working)
-
-    def _todo(self):
-        return [i for i in self.files if i.checked and i.status in ("Ready", "Failed")]
-
-    # ------------------------------------------------------- file actions --
-    def _toggle_all(self, value):
-        for item in self.files:
-            item.checked = value
-            if item in self.rows:
-                self.rows[item].refresh()
-        self.update_queue_chrome()
-
-    def _register_drop(self, widget, redraw=None):
-        try:
-            widget.drop_target_register(DND_FILES)
-            widget.dnd_bind("<<Drop>>", self._on_drop)
-            if redraw:
-                widget.dnd_bind("<<DropEnter>>", lambda e: (redraw(active=True), e.action)[1])
-                widget.dnd_bind("<<DropLeave>>", lambda e: (redraw(), e.action)[1])
-        except tk.TclError:
-            self.dnd = False  # drop support unavailable on this system; buttons still work
-
-    def _on_drop(self, event):
-        self.add_paths(self.root.tk.splitlist(event.data))
-        return event.action
+    def dropEvent(self, event):
+        self.add_paths([u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()])
 
     def add_files(self):
-        types = [("PDFs and images", " ".join(f"*{e}" for e in sorted(SUPPORTED_EXTENSIONS))), ("All files", "*.*")]
-        paths = filedialog.askopenfilenames(title="Choose files", filetypes=types)
+        types = "PDFs and images (" + " ".join(f"*{e}" for e in sorted(SUPPORTED_EXTENSIONS)) + ");;All files (*)"
+        paths, _ = QFileDialog.getOpenFileNames(self, "Choose files", "", types)
         if paths:
             self.add_paths(paths)
 
     def add_folder(self):
-        folder = filedialog.askdirectory(title="Choose a folder")
+        folder = QFileDialog.getExistingDirectory(self, "Choose a folder")
         if folder:
             self.add_paths([folder])
 
     def add_paths(self, paths):
-        if self.view != "process":
-            self.view = "process"
-            self.build()
-        known = {i.path for i in self.files}
+        self.stack.setCurrentIndex(0)
+        self.nav_buttons["process"].setChecked(True)
+        known = {i.path for i in self.model.items}
         new = []
         for path in expand_paths(paths):
             path = Path(path)
@@ -457,204 +927,118 @@ class App:
                 size = path.stat().st_size
             except OSError:
                 continue
-            kind = "pdf" if path.suffix.lower() == ".pdf" else "image"
-            item = Item(path, kind, size)
-            self.files.append(item)
-            self._make_row(item)
-            new.append(item)
+            new.append(Item(path, "pdf" if path.suffix.lower() == ".pdf" else "image", size))
+        if not new:
+            return
         self.summary = ""
-        self.update_queue_chrome()
-        if new:
-            if self.selected is None:
-                self.select(new[0])
-            for item in new:
-                self._submit_inspect(item)
+        self.model.add(new)
+        if self.selected is None:
+            self.table.selectRow(self.model.items.index(new[0]))
+        self._update_chrome()
+        for item in new:
+            self._submit_inspect(item)
 
     def _submit_inspect(self, item):
         def done(fut):
             try:
                 report, thumb = fut.result()
-                self.events.put(("meta", item, report, thumb, None))
+                self.bridge.meta.emit(item, report, thumb, None)
             except BaseException as exc:  # includes a worker that died or was cancelled
-                self.events.put(("meta", item, None, None, str(exc) or exc.__class__.__name__))
+                self.bridge.meta.emit(item, None, None, str(exc) or exc.__class__.__name__)
 
         self.pool.submit(inspect_job, item.path).add_done_callback(done)
+
+    def _toggle_item(self, item):
+        item.checked = not item.checked
+        self.model.touch(item)
+        self._update_chrome()
+
+    def _toggle_all(self):
+        value = self.select_all.isChecked()
+        for item in self.model.items:
+            item.checked = value
+        self.model.touch_all()
+        self._update_chrome()
 
     def remove_item(self, item):
         if self.working and item.status == "Working":
             return
-        self.files.remove(item)
-        row = self.rows.pop(item, None)
-        if row:
-            row.destroy()
-        if self.selected is item:
-            self.selected = self.files[0] if self.files else None
-        self.update_queue_chrome()
-        self._refresh_detail()
-
-    def _rebuild_rows(self):
-        for row in self.rows.values():
-            row.destroy()
-        self.rows = {}
-        for item in self.files:
-            self._make_row(item)
+        if item is self.selected:
+            self.selected = None
+        self.model.remove(item)
+        self._sync_selection()
+        self._update_chrome()
 
     def clear(self):
         if self.working:
             return
-        self.files.clear()
+        self.model.clear()
         self.selected = None
         self.summary = ""
-        self._rebuild_rows()
-        self.update_queue_chrome()
-        self._refresh_detail()
+        self.detail.show_item(None)
+        self._update_chrome()
 
-    def select(self, item):
-        previous = self.selected
+    def _on_current_row(self, current, _previous):
+        old = self.selected
+        item = self.model.items[current.row()] if current.isValid() else None
         self.selected = item
-        for it in (previous, item):
-            if it in self.rows:
-                self.rows[it].refresh()
-        self._refresh_detail()
+        for it in (old, item):
+            if it is not None:
+                self.model.touch(it)
+        self.detail.show_item(item)
 
-    # ------------------------------------------------------- detail panel --
-    def _photo(self, item, size):
-        """A Tk image of the item's thumbnail. Goes via PNG so Pillow's optional ImageTk isn't needed."""
-        if item.thumb is None:
-            return None
-        if size not in item.photos:
-            img = ImageOps.fit(item.thumb, (size, size)) if size <= 64 else item.thumb.copy()
-            if size > 64:
-                img.thumbnail((size, size))
-            buf = io.BytesIO()
-            img.save(buf, "PNG")
-            item.photos[size] = tk.PhotoImage(master=self.root, data=base64.b64encode(buf.getvalue()))
-        return item.photos[size]
+    def _sync_selection(self):
+        if self.selected is None and self.model.items:
+            self.table.selectRow(0)
+        elif not self.model.items:
+            self.detail.show_item(None)
 
-    def _refresh_detail(self):
-        if self.view != "process":
-            return
-        for child in self.detail_host.winfo_children():
-            child.destroy()
-        p, f, item = self.pal, self.fonts, self.selected
-        card = self._card(self.detail_host, fill="x")
-        if item is None:
-            tk.Label(card, text="Select a file to see what private data it contains.", font=f["base"], fg=p.muted,
-                     bg=p.surface, wraplength=280, justify="left").pack(padx=20, pady=40)
-            return
+    def _update_chrome(self):
+        n = len(self.model.items)
+        self.queue_title.setText(f"Files queue ({n})")
+        self.summary_label.setText(self.summary)
+        self.empty.setVisible(n == 0)
+        self._place_empty()
+        self.select_all.setChecked(n > 0 and all(i.checked for i in self.model.items))
+        todo = self._todo()
+        self.go.setText(f"Process files ({len(todo)})" if todo else "Process files")
+        self.go.setEnabled(bool(todo) and not self.working)
 
-        head = tk.Frame(card, bg=p.surface)
-        head.pack(fill="x", padx=18, pady=(18, 10))
-        photo = self._photo(item, 56)
-        if photo:
-            tk.Label(head, image=photo, bg=p.surface, bd=0).pack(side="left")
-        else:
-            icon = tk.Canvas(head, width=56, height=56, bg=p.surface, highlightthickness=0)
-            round_rect(icon, 0, 0, 56, 56, 12, fill=blend(p.surface, p.danger if item.kind == "pdf" else p.accent, .15),
-                       outline="")
-            icon.create_text(28, 28, text="PDF" if item.kind == "pdf" else "IMG", font=f["bold"],
-                             fill=p.danger if item.kind == "pdf" else p.accent)
-            icon.pack(side="left")
-        info = tk.Frame(head, bg=p.surface)
-        info.pack(side="left", padx=12, fill="x", expand=True)
-        tk.Label(info, text=item.path.name, font=f["bold"], fg=p.text, bg=p.surface, anchor="w", width=1).pack(fill="x")
-        tk.Label(info, text=human_size(item.size), font=f["small"], fg=p.muted, bg=p.surface, anchor="w").pack(fill="x")
+    def _todo(self):
+        return [i for i in self.model.items if i.checked and i.status in ("Ready", "Failed")]
 
-        tabs = tk.Frame(card, bg=p.surface)
-        tabs.pack(fill="x", padx=18)
-        for key, label in (("metadata", "Metadata found"), ("preview", "Preview")):
-            active = self.tab == key
-            cell = tk.Frame(tabs, bg=p.surface, cursor="hand2")
-            cell.pack(side="left", padx=(0, 18))
-            tk.Label(cell, text=label, font=f["bold"] if active else f["base"], bg=p.surface,
-                     fg=p.text if active else p.muted).pack()
-            tk.Frame(cell, bg=p.accent if active else p.surface, height=2).pack(fill="x", pady=(4, 0))
-            for w in [cell] + cell.winfo_children():
-                w.bind("<Button-1>", lambda e, k=key: self._set_tab(k))
-        tk.Frame(card, bg=p.border, height=1).pack(fill="x")
+    # ----- results from workers
+    def _on_meta(self, item, report, thumb, error):
+        item.report, item.thumb, item.inspect_error = report, thumb, error
+        item.pixmaps.clear()
+        if item is self.selected:
+            self.detail.rebuild()
 
-        body = tk.Frame(card, bg=p.surface)
-        body.pack(fill="x", padx=18, pady=12)
-        if self.tab == "preview":
-            self._detail_preview(body, item)
-        else:
-            self._detail_metadata(body, item)
+    def _on_started(self, item):
+        item.status = "Working"
+        self.model.touch(item)
 
-        # Size card
-        size_card = self._card(self.detail_host, fill="x", pady=(14, 0))
-        tk.Label(size_card, text="Size after processing", font=f["bold"], fg=p.text, bg=p.surface, anchor="w").pack(
-            fill="x", padx=18, pady=(14, 8))
-        row = tk.Frame(size_card, bg=p.surface)
-        row.pack(fill="x", padx=18, pady=(0, 16))
-        self._size_box(row, "Original", human_size(item.size), p.text)
-        tk.Label(row, text="→", font=f["h2"], fg=p.muted, bg=p.surface).pack(side="left", padx=8)
-        if item.result and item.result.ok:
-            saved = item.result.saved_percent
-            self._size_box(row, "After", human_size(item.result.new_size), p.success,
-                           f"{saved:.0f}% smaller" if saved > 0 else "no size change")
-        else:
-            self._size_box(row, "After", "—", p.muted, QUALITY_STEPS[self.settings.quality][0])
-        if item.status == "Failed" and item.result is not None and item.result.error:
-            tk.Label(size_card, text=item.result.error, font=f["small"], fg=p.danger, bg=p.surface, wraplength=290,
-                     justify="left", anchor="w").pack(fill="x", padx=18, pady=(0, 14))
+    def _on_done(self, item, result):
+        item.result, item.status = result, "Done" if result.ok else "Failed"
+        self.model.touch(item)
+        if item is self.selected:
+            self.detail.rebuild()
 
-    def _size_box(self, parent, title, value, color, caption=None):
-        p, f = self.pal, self.fonts
-        box = tk.Frame(parent, bg=p.surface2)
-        box.pack(side="left", fill="both", expand=True)
-        tk.Label(box, text=title, font=f["small"], fg=p.muted, bg=p.surface2, anchor="w").pack(
-            fill="x", padx=12, pady=(10, 0))
-        tk.Label(box, text=value, font=f["h2"], fg=color, bg=p.surface2, anchor="w").pack(fill="x", padx=12)
-        tk.Label(box, text=caption or " ", font=f["small"], fg=p.muted, bg=p.surface2, anchor="w").pack(
-            fill="x", padx=12, pady=(0, 10))
+    def _on_finished(self):
+        self.working = False
+        items = self.model.items
+        done = [i for i in items if i.result and i.result.ok]
+        failed = [i for i in items if i.status == "Failed"]
+        saved = sum(i.result.original_size - i.result.new_size for i in done)
+        parts = []
+        if done:
+            parts.append(f"{len(done)} cleaned" + (f", saved {human_size(saved)}" if saved > 0 else ""))
+        if failed:
+            parts.append(f"{len(failed)} failed")
+        self.summary = " · ".join(parts)
+        self._update_chrome()
 
-    def _set_tab(self, key):
-        self.tab = key
-        self._refresh_detail()
-
-    def _detail_metadata(self, body, item):
-        p, f = self.pal, self.fonts
-        if item.report is None:
-            text = item.inspect_error or "Reading metadata…"
-            tk.Label(body, text=text, font=f["base"], fg=p.danger if item.inspect_error else p.muted, bg=p.surface,
-                     anchor="w", wraplength=290, justify="left").pack(fill="x", pady=8)
-            return
-        report = item.report
-        if report.note:
-            tk.Label(body, text=report.note, font=f["base"], fg=p.danger, bg=p.surface, anchor="w",
-                     wraplength=290, justify="left").pack(fill="x", pady=8)
-            return
-        if report.clean:
-            tk.Label(body, text="No identifying metadata found.", font=f["base"], fg=p.success, bg=p.surface,
-                     anchor="w").pack(fill="x", pady=8)
-            return
-        for label, value in report.fields:
-            line = tk.Frame(body, bg=p.surface)
-            line.pack(fill="x", pady=3)
-            tk.Label(line, text=label, font=f["base"], fg=p.muted, bg=p.surface, anchor="w").pack(side="left")
-            tk.Label(line, text=value, font=f["base"], fg=p.text, bg=p.surface, anchor="e", justify="right",
-                     wraplength=170).pack(side="right")
-        if report.other_count:
-            line = tk.Frame(body, bg=p.surface)
-            line.pack(fill="x", pady=3)
-            tk.Label(line, text="Other (EXIF, IPTC, XMP)", font=f["base"], fg=p.muted, bg=p.surface).pack(side="left")
-            tk.Label(line, text=f"{report.other_count} more", font=f["base"], fg=p.text, bg=p.surface).pack(side="right")
-        removed = "Removed after processing." if item.status == "Done" else "This metadata will be removed."
-        tag = tk.Label(body, text=removed, font=f["small"], bg=blend(p.surface, p.success if item.status == "Done"
-                                                                     else p.danger, .14),
-                       fg=p.success if item.status == "Done" else p.danger, padx=10, pady=5)
-        tag.pack(anchor="w", pady=(12, 0))
-
-    def _detail_preview(self, body, item):
-        p, f = self.pal, self.fonts
-        photo = self._photo(item, 260)
-        if photo:
-            tk.Label(body, image=photo, bg=p.surface, bd=0).pack(pady=4)
-        else:
-            text = "PDF previews are not shown." if item.kind == "pdf" else "Preview unavailable."
-            tk.Label(body, text=text, font=f["base"], fg=p.muted, bg=p.surface).pack(pady=24)
-
-    # --------------------------------------------------------- processing --
+    # ----- processing
     def start(self):
         todo = self._todo()
         if self.working or not todo:
@@ -665,171 +1049,52 @@ class App:
             try:
                 Path(out).mkdir(parents=True, exist_ok=True)
             except OSError as exc:
-                messagebox.showerror("StripSafe", f"Can't use that output folder:\n{exc}")
+                QMessageBox.critical(self, "StripSafe", f"Can't use that output folder:\n{exc}")
                 return
         self.working = True
         self.summary = ""
         for item in todo:
             item.status, item.result = "Ready", None
-        self.update_queue_chrome()
+            self.model.touch(item)
+        self._update_chrome()
         threading.Thread(target=self._dispatch, args=(todo, preset_name, out), daemon=True).start()
 
     def _dispatch(self, items, preset_name, out):
         """Feed the worker pool, keeping only as many jobs in flight as there are workers,
         so a row says "Working" only while a process is really on it."""
         slots = threading.Semaphore(self.pool.max_workers)
-        futures = []
+        reported = []  # one Event per job, set once its result has been handed to the window
         for item in items:
             slots.acquire()
-            self.events.put(("start", item))
+            self.bridge.started.emit(item)
             fut = self.pool.submit(process_job, item.path, preset_name, out)
-            futures.append(fut)
+            reported.append(event := threading.Event())
 
-            def done(f, item=item):
+            def done(f, item=item, event=event):
                 try:
                     result = f.result()
                 except BaseException as exc:  # worker crashed, e.g. ran out of memory on a huge PDF
                     result = Result(item.path, None, item.size, 0,
                                     f"Processing stopped unexpectedly ({exc.__class__.__name__})")
-                self.events.put(("done", item, result))
+                self.bridge.done.emit(item, result)
+                event.set()
                 slots.release()
 
             fut.add_done_callback(done)
-        for fut in futures:
-            try:
-                fut.exception()  # wait for completion
-            except BaseException:
-                pass
-        self.events.put(("finished", None))
+        for event in reported:
+            event.wait()  # "finished" must queue after every "done", or the summary misses the last file
+        self.bridge.finished.emit()
 
-    def close(self):
+    def closeEvent(self, event):
         self.pool.shutdown()
-        self.root.destroy()
-
-    def _poll(self):
-        try:
-            for _ in range(40):  # bounded so one tick can never hold the window for long
-                event = self.events.get_nowait()
-                kind = event[0]
-                if kind == "meta":
-                    _, item, report, thumb, error = event
-                    item.report, item.thumb, item.inspect_error = report, thumb, error
-                    if item is self.selected:
-                        self._refresh_detail()
-                elif kind == "start":
-                    event[1].status = "Working"
-                    self._refresh_row(event[1])
-                elif kind == "done":
-                    _, item, result = event
-                    item.result, item.status = result, "Done" if result.ok else "Failed"
-                    self._refresh_row(item)
-                    if item is self.selected:
-                        self._refresh_detail()
-                else:
-                    self._finish()
-        except queue.Empty:
-            pass
-        self.root.after(40, self._poll)
-
-    def _refresh_row(self, item):
-        if self.view == "process" and item in self.rows:
-            self.rows[item].refresh()
-
-    def _finish(self):
-        self.working = False
-        done = [i for i in self.files if i.result and i.result.ok]
-        failed = [i for i in self.files if i.status == "Failed"]
-        saved = sum(i.result.original_size - i.result.new_size for i in done)
-        parts = []
-        if done:
-            parts.append(f"{len(done)} cleaned" + (f", saved {human_size(saved)}" if saved > 0 else ""))
-        if failed:
-            parts.append(f"{len(failed)} failed")
-        self.summary = " · ".join(parts)
-        self.update_queue_chrome()
-
-    # ------------------------------------------------------ settings view --
-    def _build_settings(self):
-        p, f = self.pal, self.fonts
-        page = tk.Frame(self.content, bg=p.bg)
-        page.pack(fill="both", expand=True, padx=32, pady=28)
-        self._title(page, "Settings", "Your choices are saved on this computer only.")
-
-        card = self._card(page, fill="x", pady=(20, 0))
-        self._setting_row(card, "Appearance", "Switch between the dark and light theme.").pack(fill="x")
-        row = card.winfo_children()[-1]
-        Segmented(row, p, f["base"], [("dark", "Dark"), ("light", "Light")], self.settings.theme,
-                  self._set_theme).pack(side="right", padx=20)
-
-        card2 = self._card(page, fill="x", pady=(14, 0))
-        row = self._setting_row(card2, "Default compression", "Used for every batch you process.")
-        row.pack(fill="x")
-        self._quality_controls(row, p.surface).pack(side="right", padx=20, pady=12)
-
-        card3 = self._card(page, fill="x", pady=(14, 0))
-        row = self._setting_row(card3, "Output folder", "Cleaned copies are saved here. Originals are never changed.")
-        row.pack(fill="x")
-        right = tk.Frame(row, bg=p.surface)
-        right.pack(side="right", padx=20, pady=12)
-        self._output_controls(right, p.surface).pack()
-        Button(right, "Save next to originals", self._reset_output, p, f["small"], variant="ghost", height=28,
-               bg=p.surface).pack(anchor="e", pady=(4, 0))
-
-    def _setting_row(self, card, title, subtitle):
-        p, f = self.pal, self.fonts
-        row = tk.Frame(card, bg=p.surface)
-        left = tk.Frame(row, bg=p.surface)
-        left.pack(side="left", padx=20, pady=16)
-        tk.Label(left, text=title, font=f["bold"], fg=p.text, bg=p.surface, anchor="w").pack(fill="x")
-        tk.Label(left, text=subtitle, font=f["small"], fg=p.muted, bg=p.surface, anchor="w").pack(fill="x")
-        row.pack(fill="x")
-        return row
-
-    def _set_theme(self, theme):
-        self.settings.theme = theme
-        settings_store.save(self.settings)
-        self.build()
-
-    def _reset_output(self):
-        self.settings.output_dir = None
-        settings_store.save(self.settings)
-        self._refresh_out_label()
-
-    # --------------------------------------------------------- about view --
-    def _build_about(self):
-        p, f = self.pal, self.fonts
-        page = tk.Frame(self.content, bg=p.bg)
-        page.pack(fill="both", expand=True, padx=32, pady=28)
-        self._title(page, "About StripSafe", f"Version {__version__}")
-        card = self._card(page, fill="x", pady=(20, 0))
-        blocks = [
-            ("What it does",
-             "Removes hidden personal data from PDFs and images (author names, GPS location, camera details, "
-             "timestamps, editing history) and compresses them so they are easy to email."),
-            ("Private by design",
-             "Everything happens on this computer. StripSafe never connects to the internet and never uploads "
-             "your files. Cleaned copies are saved as new files, so your originals are never changed."),
-            ("Supported files", "PDF, JPG, PNG and WebP."),
-            ("Good to know",
-             "Text and pictures you can see on the page are not altered. Password-protected PDFs need their "
-             "password removed first."),
-            ("License", "Free software under the GNU GPL v3."),
-        ]
-        for title, text in blocks:
-            tk.Label(card, text=title, font=f["bold"], fg=p.text, bg=p.surface, anchor="w").pack(
-                fill="x", padx=22, pady=(16, 0))
-            tk.Label(card, text=text, font=f["base"], fg=p.muted, bg=p.surface, anchor="w", justify="left",
-                     wraplength=640).pack(fill="x", padx=22, pady=(2, 0))
-        tk.Frame(card, bg=p.surface, height=16).pack()
+        super().closeEvent(event)
 
 
 def main(argv=None) -> int:
-    try:
-        root = TkinterDnD.Tk() if HAVE_DND else tk.Tk()
-    except Exception:  # tkdnd's native library failed to load: run without drag-and-drop
-        root = tk.Tk()
-    app = App(root)
+    app = QApplication.instance() or QApplication([sys.argv[0]])
+    app.setApplicationName("StripSafe")
+    window = MainWindow()
+    window.show()
     if argv:
-        app.add_paths(argv)
-    root.mainloop()
-    return 0
+        window.add_paths(argv)
+    return app.exec()

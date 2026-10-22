@@ -1,3 +1,2 @@
 -r requirements.txt
--r requirements-optional.txt
 pyinstaller>=6.0
