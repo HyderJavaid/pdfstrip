@@ -13,9 +13,9 @@ from typing import Optional
 from PIL import ImageOps
 
 from . import __version__, settings as settings_store
-from .core import SUPPORTED_EXTENSIONS, Result, expand_paths, human_size, is_supported, process_file
-from .metadata import MetaReport, inspect_file, make_thumbnail
-from .presets import get_preset
+from .core import SUPPORTED_EXTENSIONS, Result, expand_paths, human_size, is_supported
+from .metadata import MetaReport
+from .workers import WorkerPool, inspect_job, process_job
 from .ui.theme import PALETTES, make_fonts
 from .ui.widgets import Button, Checkbox, Pill, Segmented, Slider, blend, draw_logo, round_rect
 
@@ -74,8 +74,11 @@ class Row:
         self.remove = tk.Label(self.frame, text="✕", font=f["small"], fg=p.muted, bg=p.surface, cursor="hand2")
         self.remove.grid(row=0, column=5)
         self.remove.bind("<Button-1>", lambda e: app.remove_item(item))
+        self.sep = tk.Frame(parent, bg=p.border, height=1)
         self.pill_kind = None
         self.pill_status = None
+        self._bg = None
+        self._status_shown = None
         for w in (self.frame, self.name, self.size, self.kind_cell, self.status_cell):
             w.bind("<Button-1>", lambda e: app.select(item))
         self.refresh()
@@ -84,32 +87,46 @@ class Row:
         self.item.checked = value
         self.app.update_queue_chrome()
 
+    def pack(self):
+        self.frame.pack(fill="x")
+        self.sep.pack(fill="x")
+
+    def destroy(self):
+        self.frame.destroy()
+        self.sep.destroy()
+
     def refresh(self):
+        """Update in place; widgets are only touched when what they show has changed."""
         p, f, item = self.app.pal, self.app.fonts, self.item
         bg = p.surface2 if self.app.selected is item else p.surface
-        for w in (self.frame, self.name, self.size, self.kind_cell, self.status_cell, self.remove):
-            w.config(bg=bg)
-        self.check.config(bg=bg)
-        self.check.set(item.checked)
-        self.check.draw()
-        if self.pill_kind is None:
+        bg_changed = bg != self._bg
+        if bg_changed:
+            for w in (self.frame, self.name, self.size, self.kind_cell, self.status_cell, self.remove):
+                w.config(bg=bg)
+            self.check.config(bg=bg)
+            self.check.draw()
+        if self.check.checked != item.checked:
+            self.check.set(item.checked)
+        if self.pill_kind is None or bg_changed:
+            if self.pill_kind is not None:
+                self.pill_kind.destroy()
             color = p.danger if item.kind == "pdf" else p.accent
             self.pill_kind = Pill(self.kind_cell, "PDF" if item.kind == "pdf" else "Image", color, f["small"], bg)
             self.pill_kind.pack()
-        else:
-            self.pill_kind.config(bg=bg)
+            self.pill_kind.bind("<Button-1>", lambda e: self.app.select(item))
         if item.result and item.result.ok:
-            self.size.config(text=f"{human_size(item.size)}  →  {human_size(item.result.new_size)}",
+            self.size.config(text=f"{human_size(item.size)}  \u2192  {human_size(item.result.new_size)}",
                              fg=p.success)
         else:
             self.size.config(text=human_size(item.size), fg=p.muted)
-        if self.pill_status is not None:
-            self.pill_status.destroy()
-        color = {"Ready": p.muted, "Working": p.accent, "Done": p.success, "Failed": p.danger}[item.status]
-        self.pill_status = Pill(self.status_cell, item.status, color, f["small"], bg)
-        self.pill_status.pack()
-        for w in (self.pill_kind, self.pill_status):
-            w.bind("<Button-1>", lambda e: self.app.select(item))
+        if bg_changed or item.status != self._status_shown:
+            if self.pill_status is not None:
+                self.pill_status.destroy()
+            color = {"Ready": p.muted, "Working": p.accent, "Done": p.success, "Failed": p.danger}[item.status]
+            self.pill_status = Pill(self.status_cell, item.status, color, f["small"], bg)
+            self.pill_status.pack()
+            self.pill_status.bind("<Button-1>", lambda e: self.app.select(item))
+        self._bg, self._status_shown = bg, item.status
 
 
 class App:
@@ -128,11 +145,13 @@ class App:
         self.working = False
         self.summary = ""
         self.events = queue.Queue()
+        self.pool = WorkerPool()
+        root.protocol("WM_DELETE_WINDOW", self.close)
         root.title("StripSafe")
         root.geometry("1240x740")
         root.minsize(1120, 640)
         self.build()
-        root.after(100, self._poll)
+        root.after(40, self._poll)
 
     # ------------------------------------------------------------ layout --
     def build(self):
@@ -367,8 +386,7 @@ class App:
 
     def _make_row(self, item):
         row = Row(self, self.rows_frame, item)
-        row.frame.pack(fill="x")
-        tk.Frame(self.rows_frame, bg=self.pal.border, height=1).pack(fill="x")
+        row.pack()
         self.rows[item] = row
         return row
 
@@ -449,30 +467,34 @@ class App:
         if new:
             if self.selected is None:
                 self.select(new[0])
-            threading.Thread(target=self._inspect_worker, args=(new,), daemon=True).start()
+            for item in new:
+                self._submit_inspect(item)
 
-    def _inspect_worker(self, items):
-        for item in items:
+    def _submit_inspect(self, item):
+        def done(fut):
             try:
-                report = inspect_file(item.path)
-                thumb = make_thumbnail(item.path)
+                report, thumb = fut.result()
                 self.events.put(("meta", item, report, thumb, None))
-            except Exception as exc:
+            except BaseException as exc:  # includes a worker that died or was cancelled
                 self.events.put(("meta", item, None, None, str(exc) or exc.__class__.__name__))
+
+        self.pool.submit(inspect_job, item.path).add_done_callback(done)
 
     def remove_item(self, item):
         if self.working and item.status == "Working":
             return
         self.files.remove(item)
-        self._rebuild_rows()
+        row = self.rows.pop(item, None)
+        if row:
+            row.destroy()
         if self.selected is item:
             self.selected = self.files[0] if self.files else None
         self.update_queue_chrome()
         self._refresh_detail()
 
     def _rebuild_rows(self):
-        for child in self.rows_frame.winfo_children():
-            child.destroy()
+        for row in self.rows.values():
+            row.destroy()
         self.rows = {}
         for item in self.files:
             self._make_row(item)
@@ -637,8 +659,7 @@ class App:
         todo = self._todo()
         if self.working or not todo:
             return
-        _label, preset_name, _desc = QUALITY_STEPS[self.settings.quality]
-        preset = get_preset(preset_name)
+        preset_name = QUALITY_STEPS[self.settings.quality][1]
         out = self.settings.output_dir
         if out and not Path(out).exists():
             try:
@@ -651,17 +672,43 @@ class App:
         for item in todo:
             item.status, item.result = "Ready", None
         self.update_queue_chrome()
-        threading.Thread(target=self._worker, args=(todo, preset, out), daemon=True).start()
+        threading.Thread(target=self._dispatch, args=(todo, preset_name, out), daemon=True).start()
 
-    def _worker(self, items, preset, out):
+    def _dispatch(self, items, preset_name, out):
+        """Feed the worker pool, keeping only as many jobs in flight as there are workers,
+        so a row says "Working" only while a process is really on it."""
+        slots = threading.Semaphore(self.pool.max_workers)
+        futures = []
         for item in items:
+            slots.acquire()
             self.events.put(("start", item))
-            self.events.put(("done", item, process_file(item.path, preset, out)))
+            fut = self.pool.submit(process_job, item.path, preset_name, out)
+            futures.append(fut)
+
+            def done(f, item=item):
+                try:
+                    result = f.result()
+                except BaseException as exc:  # worker crashed, e.g. ran out of memory on a huge PDF
+                    result = Result(item.path, None, item.size, 0,
+                                    f"Processing stopped unexpectedly ({exc.__class__.__name__})")
+                self.events.put(("done", item, result))
+                slots.release()
+
+            fut.add_done_callback(done)
+        for fut in futures:
+            try:
+                fut.exception()  # wait for completion
+            except BaseException:
+                pass
         self.events.put(("finished", None))
+
+    def close(self):
+        self.pool.shutdown()
+        self.root.destroy()
 
     def _poll(self):
         try:
-            while True:
+            for _ in range(40):  # bounded so one tick can never hold the window for long
                 event = self.events.get_nowait()
                 kind = event[0]
                 if kind == "meta":
@@ -682,7 +729,7 @@ class App:
                     self._finish()
         except queue.Empty:
             pass
-        self.root.after(100, self._poll)
+        self.root.after(40, self._poll)
 
     def _refresh_row(self, item):
         if self.view == "process" and item in self.rows:

@@ -15,7 +15,9 @@ def app(tmp_path, monkeypatch):
     except tk.TclError:
         pytest.skip("no display available")
     root.withdraw()
-    yield gui.App(root)
+    app = gui.App(root)
+    yield app
+    app.pool.shutdown()
     root.destroy()
 
 
