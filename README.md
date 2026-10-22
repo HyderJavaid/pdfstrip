@@ -43,7 +43,7 @@ Requires Python 3.9+ with tkinter.
 
 ```
 sudo apt install python3-tk python3-venv
-git clone https://github.com/HyderJavaid/pdfstrip.git && cd pdfstrip
+git clone https://github.com/HyderJavaid/StripSafe.git && cd StripSafe
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -51,7 +51,7 @@ pip install -r requirements-optional.txt   # optional: enables drag-and-drop
 python -m stripsafe
 ```
 
-Next time, just `cd pdfstrip && source .venv/bin/activate && python -m stripsafe`.
+Next time, just `cd StripSafe && source .venv/bin/activate && python -m stripsafe`.
 
 ### macOS / Windows
 
