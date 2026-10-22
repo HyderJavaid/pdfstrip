@@ -43,7 +43,7 @@ The window is built with [Qt](https://doc.qt.io/qtforpython-6/) (PySide6), so it
 
 ```
 sudo apt install python3-venv libxcb-cursor0
-git clone https://github.com/HyderJavaid/StripSafe.git && cd StripSafe
+git clone https://github.com/naOomeow/StripSafe.git && cd StripSafe
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
