@@ -1063,28 +1063,26 @@ class MainWindow(QMainWindow):
         """Feed the worker pool, keeping only as many jobs in flight as there are workers,
         so a row says "Working" only while a process is really on it."""
         slots = threading.Semaphore(self.pool.max_workers)
-        futures = []
+        reported = []  # one Event per job, set once its result has been handed to the window
         for item in items:
             slots.acquire()
             self.bridge.started.emit(item)
             fut = self.pool.submit(process_job, item.path, preset_name, out)
-            futures.append(fut)
+            reported.append(event := threading.Event())
 
-            def done(f, item=item):
+            def done(f, item=item, event=event):
                 try:
                     result = f.result()
                 except BaseException as exc:  # worker crashed, e.g. ran out of memory on a huge PDF
                     result = Result(item.path, None, item.size, 0,
                                     f"Processing stopped unexpectedly ({exc.__class__.__name__})")
                 self.bridge.done.emit(item, result)
+                event.set()
                 slots.release()
 
             fut.add_done_callback(done)
-        for fut in futures:
-            try:
-                fut.exception()  # wait for completion
-            except BaseException:
-                pass
+        for event in reported:
+            event.wait()  # "finished" must queue after every "done", or the summary misses the last file
         self.bridge.finished.emit()
 
     def closeEvent(self, event):
