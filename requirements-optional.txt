@@ -1,2 +1,0 @@
-# Enables drag-and-drop in the GUI. Without it the file picker is used.
-tkinterdnd2>=0.3
