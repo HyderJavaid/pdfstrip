@@ -29,14 +29,33 @@ Cleaned copies are written as `name_clean.ext` (or `name_clean_2.ext`, ...). Ori
 
 ## Install and run
 
-Requires Python 3.9+ with tkinter (on Debian/Ubuntu: `sudo apt install python3-tk`).
+Requires Python 3.9+ with tkinter.
+
+### Linux Mint / Ubuntu / Debian
+
+```
+sudo apt install python3-tk python3-venv
+git clone https://github.com/HyderJavaid/pdfstrip.git && cd pdfstrip
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+pip install -r requirements-optional.txt   # optional: enables drag-and-drop
+python -m pdfstrip
+```
+
+Next time, just `cd pdfstrip && source .venv/bin/activate && python -m pdfstrip`.
+
+### macOS / Windows
+
+tkinter ships with the python.org installers. Then:
 
 ```
 pip install -r requirements.txt
 pip install -r requirements-optional.txt   # optional: enables drag-and-drop
-python -m pdfstrip                         # opens the window
-python -m pdfstrip report.pdf photo.jpg    # opens the window with these files queued
+python -m pdfstrip
 ```
+
+Pass files to open the window with them queued: `python -m pdfstrip report.pdf photo.jpg`.
 
 Without `tkinterdnd2` the window uses the "Add files..." / "Add folder..." buttons instead of drag-and-drop.
 
