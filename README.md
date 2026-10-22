@@ -65,6 +65,23 @@ A headless command line is also available:
 python -m pdfstrip.cli -p balanced -o cleaned/ *.pdf *.jpg
 ```
 
+## Standalone app (no Python needed)
+
+Pre-built single-file apps for Linux and Windows are attached to each GitHub release (and as downloadable artifacts on every CI run). Download, then:
+
+* **Linux:** `chmod +x pdfstrip-linux-x86_64 && ./pdfstrip-linux-x86_64` (or tick "Allow executing as program" in the file's Properties, then double-click).
+* **Windows:** double-click `pdfstrip-windows-x86_64.exe`. SmartScreen may warn because the file isn't code-signed; choose "More info" then "Run anyway".
+
+Build one yourself on the OS you want to target (PyInstaller can't cross-compile):
+
+```
+pip install -r requirements-build.txt
+pyinstaller packaging/pdfstrip.spec
+# result: dist/pdfstrip  (dist\pdfstrip.exe on Windows)
+```
+
+Releases are built by `.github/workflows/build.yml` whenever a tag like `v0.1.0` is pushed.
+
 ## Tests
 
 ```
